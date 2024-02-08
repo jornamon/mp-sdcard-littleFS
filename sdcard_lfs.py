@@ -24,23 +24,22 @@ Update @jornamon 2024:
 - Intercepts ioctl(6) erase command and ioctl(3) to handle the sync command.
 - Now it can be used with LittleFS2.
 - Implemented a block cache of variable size. LFS2 performs horribly ons SD cards without one.
-  It makes many small un misaligned reads and writes, and the cache helps to cope with that.
+  It makes many small and misaligned reads and writes, and the cache helps to cope with that.
+- The sync method now is more clever and tries to take advantage of multiblock writes.
 
 TODO:
 - Multiblock operations. It seems LFS2 does not use them, so it would primarily benefit FAT.
 - Multiblock reads can be done:
-    a) Implementing a separate method to read severl blocs from cache (and SD card if needed),
+    a) Implementing a separate method to read several blocks from cache (and SD card if needed),
     which would apparently only benefit FAT.
     b) Implement a read ahead policy with next blocks. LFS2 could benefit from this, 
     but needs to be measured first, bacause given that LFS2 implements wear leveling,
     it cold be that contiguous blocks are not often requested.
-- Multiblock writes can be done:
+- Multiblock writes ideas:
     a) Implementing a separate method to write several blocks to cache (and SD card if needed),
-    which would apparently only benefit FAT.
-    b) Implement a more clever sync() methods that tries to fin contiguos blocks in cache to 
-    take advantage o multiblock writes. This would benefit LFS2, but needs to be measured first
-    in order to determine if it's worth it.
-    
+    which would apparently only benefit FAT. A read ahead policy would have a similar result,
+    just not completely adjusted for the requested blocks.
+
 Original driver: https://github.com/micropython/micropython-lib/blob/master/micropython/drivers/storage/sdcard/sdcard.py
 """
 
@@ -63,7 +62,7 @@ _TOKEN_DATA = const(0xFE)
 
 
 class SDCard:
-    def __init__(self, spi, cs, baudrate=1320000, cache_max_size=1, debug=False):
+    def __init__(self, spi, cs, baudrate=1320000, cache_max_size=8, debug=False):
         self.spi = spi
         self.cs = cs
 
@@ -88,11 +87,6 @@ class SDCard:
         self._blocks: dict[int, int] = {}
         self._cache: list[bytearray] = [bytearray(512) for _ in range(cache_max_size)]
         self._mvc: list[memoryview] = [memoryview(b) for b in self._cache]
-        if cache_max_size == 0:
-            # No cache, read/write directly from/to SD card
-            self.get = self.read_from_sd
-            self.put = self.write_to_sd
-        # self.show_cache_status()  # Debug
         ####
 
         # initialise the card
@@ -151,7 +145,7 @@ class SDCard:
             self.sectors = capacity // 512
         else:
             raise OSError("SD card CSD format not supported")
-        print("init_car: sectors", self.sectors)
+        # print("init_car: sectors", self.sectors)
 
         # CMD16: set block length to 512 bytes
         if self.cmd(16, 512, 0) != 0:
@@ -187,7 +181,7 @@ class SDCard:
                 else:
                     # SDHC/SDXC card, uses block addressing in read/write/erase commands
                     self.cdv = 1
-                print("[SDCard] v2 card")
+                # print("[SDCard] v2 card")
                 return
         raise OSError("timeout waiting for v2 card")
 
@@ -251,7 +245,6 @@ class SDCard:
         # read checksum
         self.spi.write(b"\xff")
         self.spi.write(b"\xff")
-
         self.cs(1)
         self.spi.write(b"\xff")
 
@@ -292,6 +285,14 @@ class SDCard:
         """Get a block from cache."""
         if len(buf) != 512:
             raise ValueError("Buffer must be 512 bytes.")
+
+        if self.debug:
+            self.stats.register_contiguity("get", block_num)
+
+        if self._cache_max_size == 0:
+            self.read_from_sd(block_num, buf)
+            return
+
         uo = self._usage_order
         blocks = self._blocks
         mvc = self._mvc
@@ -313,6 +314,8 @@ class SDCard:
                 slot = blocks[oldest_block]
                 if oldest_block != -1 and dirty[slot]:
                     self.write_to_sd(oldest_block, mvc[slot])
+                    if self.debug:
+                        self.stats.stats["sb_flush"] += 1
                 blocks.pop(oldest_block, None)
             else:
                 slot = cache_size
@@ -326,28 +329,42 @@ class SDCard:
         """Put a block into cache."""
         if len(buf) != 512:
             raise ValueError("Buffer must be 512 bytes.")
+
+        if self.debug:
+            self.stats.register_contiguity("put", block_num)
+
+        # No cache
+        if self._cache_max_size == 0:
+            self.write_to_sd(block_num, buf)
+            return
+
         uo = self._usage_order
         blocks = self._blocks
         mvc = self._mvc
         mvb = memoryview(buf)
         dirty = self._dirty
+
         if block_num in blocks:
+            # Cache hit
             if self.debug:
-                self.stats.stats["wb_cache_hit"] += 1  # type: ignore
+                self.stats.stats["wb_cache_hit"] += 1
             slot = blocks[block_num]
             mvc[slot][:] = mvb[:]
             self._dirty[slot] = True
             uo.remove(block_num)
             uo.append(block_num)
         else:
+            # Cache miss
             if self.debug:
-                self.stats.stats["wb_cache_miss"] += 1  # type: ignore
+                self.stats.stats["wb_cache_miss"] += 1
             cache_size = len(blocks)
             if cache_size == self._cache_max_size:
                 oldest_block = uo.pop(0)
                 slot = blocks[oldest_block]
                 if oldest_block != -1 and dirty[slot]:
                     self.write_to_sd(oldest_block, mvc[slot])
+                    if self.debug:
+                        self.stats.stats["sb_flush"] += 1
                 blocks.pop(oldest_block, None)
             else:
                 slot = cache_size
@@ -360,10 +377,54 @@ class SDCard:
         """Write all dirty blocks to SD card."""
         if self._cache_max_size == 0:
             return
-        for block_num, slot in self._blocks.items():
-            if block_num != -1 and self._dirty[slot]:
-                self.write_to_sd(block_num, self._mvc[slot])
-                self._dirty[slot] = False
+        mvc = self._mvc
+        dirty = self._dirty
+        # Dumb sync. Write dirty blocks one by one
+        # for block_num, slot in self._blocks.items():
+        #     if block_num != -1 and dirty[slot]:
+        #         self.write_to_sd(block_num, mvc[slot])
+        #         dirty[slot] = False
+
+        # Smart sync. Use multiblock writes if possible
+        dirty_blocks = [
+            (block_num, slot) for block_num, slot in self._blocks.items() if dirty[slot]
+        ]
+        dirty_blocks.sort(key=lambda x: x[0])
+
+        i = 0
+        while i < len(dirty_blocks) - 1:
+            if dirty_blocks[i + 1][0] - dirty_blocks[i][0] != 1:
+                # Not contiguous blocks
+                self.write_to_sd(dirty_blocks[i][0], mvc[dirty_blocks[i][1]])
+                dirty[dirty_blocks[i][1]] = False
+                i += 1
+                if self.debug:
+                    self.stats.stats["sb_sync"] += 1
+            else:
+                # Contiguous blocks
+                contiguos_blocks = 0
+                if self.cmd(25, dirty_blocks[i][0] * self.cdv, 0) != 0:
+                    raise OSError(5)  # EIO
+                self.write(_TOKEN_CMD25, mvc[dirty_blocks[i][1]])
+                dirty[dirty_blocks[i][1]] = False
+                i += 1
+                contiguos_blocks += 1
+                while (
+                    i < len(dirty_blocks) - 1
+                    and dirty_blocks[i + 1][0] - dirty_blocks[i][0] == 1
+                ):
+                    self.write(_TOKEN_CMD25, mvc[dirty_blocks[i][1]])
+                    dirty[dirty_blocks[i][1]] = False
+                    i += 1
+                    contiguos_blocks += 1
+                # Last contiguous block
+                self.write(_TOKEN_CMD25, mvc[dirty_blocks[i][1]])
+                self.write_token(_TOKEN_STOP_TRAN)
+                dirty[dirty_blocks[i][1]] = False
+                i += 1
+                contiguos_blocks += 1
+                if self.debug:
+                    self.stats.stats["mb_sync"] += contiguos_blocks
 
     def read_from_sd(self, block_num: int, buf: memoryview) -> None:
         """Read a block from SD card."""
@@ -401,6 +462,7 @@ class SDCard:
             miss_both = offset > 0 and (offset + len_buf) % 512 > 0
             self.stats.collect(
                 "rb",
+                block_num=block_num,
                 length=len_buf,
                 nblocks=nblocks,
                 aligned=aligned,
@@ -444,7 +506,7 @@ class SDCard:
         if offset < 0:
             raise ValueError("writeblocks: Offset must be non-negative")
 
-        # Adjust the block number based on the offset
+        # Adjust for offset bigger than block size. Is this a thing?
         len_buf = len(buf)
         block_num += offset // 512
         offset %= 512
@@ -461,6 +523,7 @@ class SDCard:
             miss_both = offset > 0 and (offset + len_buf) % 512 > 0
             self.stats.collect(
                 "wb",
+                block_num=block_num,
                 length=len_buf,
                 nblocks=nblocks,
                 aligned=aligned,
@@ -475,17 +538,20 @@ class SDCard:
         mvb = memoryview(buf)
 
         if nblocks == 1:
-            self.get(block_num, mvt)
-            mvt[offset : offset + len_buf] = mvb[:]
-            self.put(block_num, mvt)
+            if offset == 0 and (offset + len_buf) == 512:
+                # Single complete block, no need to read
+                self.put(block_num, mvb)
+            else:
+                # Single partial block, need to read first
+                self.get(block_num, mvt)
+                mvt[offset : offset + len_buf] = mvb[:]
+                self.put(block_num, mvt)
         else:
             bytes_written = 0
-
             # Handle the initial partial block write if there's an offset
             if first_misaligned > 0:
                 self.get(block_num, mvt)
                 bytes_for_first_block = 512 - offset
-                # Update block content
                 mvt[offset:] = mvb[0:bytes_for_first_block]
                 self.put(block_num, mvt)
                 bytes_written += bytes_for_first_block
@@ -516,6 +582,16 @@ class SDCard:
         if op == 6:  # Ersase block, handled by the controller
             return 0
 
+    def cache_reset(self, cache_max_size: int) -> None:
+        """Reset the cache. This is mainly for testing purposes, to change
+        the cache size on the fly during test runs."""
+        self._cache_max_size = cache_max_size
+        self._usage_order = []
+        self._dirty = [False for _ in range(cache_max_size)]
+        self._blocks = {}
+        self._cache = [bytearray(512) for _ in range(cache_max_size)]
+        self._mvc = [memoryview(b) for b in self._cache]
+
     def show_cache_status(self):
         """Print the cache status."""
         print("-" * 40)
@@ -525,7 +601,8 @@ class SDCard:
         print(" - Dirty", self._dirty)
 
     class Stats:
-        """Collect statistics about readblocks and writeblocks calls for debugging purposes"""
+        """Collect statistics about readblocks and writeblocks calls for debugging purposes.
+        If the driver is instantiated with debug=False (default), this class is not instantiated."""
 
         def __init__(self):
             from collections import OrderedDict
@@ -578,13 +655,21 @@ class SDCard:
                     "ioctl(4) num_blocks": 0,
                     "ioctl(5) block_size": 0,
                     "ioctl(6) erase_block": 0,
-                    "auto_sync": 0,
+                    "sb_flush": 0,
+                    "sb_sync": 0,
+                    "mb_sync": 0,
                 }
             )
+
+            # Stats for analysing the contiguity of the blocks requested.
+            self.contiguity = OrderedDict()
+            self.last_block = None
+            self.streak = 0
 
         def collect(
             self,
             op,
+            block_num=0,
             length=0,
             nblocks=0,
             aligned=False,
@@ -597,7 +682,7 @@ class SDCard:
             self.samples += 1
             if self.show_every != 0 and self.samples % self.show_every == 0:
                 self.print_stats()
-            # noqa
+
             s = self.stats
             s["samples"] += 1  # type: ignore
             if op == "rb":
@@ -664,14 +749,44 @@ class SDCard:
 
             # noqa
 
+        def register_contiguity(self, op, block_num):
+            """Registers streaks of contiguous requested blocks"""
+            if block_num == self.last_block:
+                return
+            if self.last_block is not None and block_num == self.last_block + 1:
+                self.streak += 1
+            else:
+                if self.streak > 0:
+                    self.contiguity[self.streak] = self.contiguity.get(self.streak, 0) + 1
+                self.streak = 1
+            self.last_block = block_num
+
+        def end_contiguity(self):
+            """Close the last ongoing streak"""
+            if self.streak > 0:
+                self.contiguity[self.streak] = self.contiguity.get(self.streak, 0) + 1
+                self.streak = 0
+
+        def print_contiguity(self):
+            """Print block contiguity stats"""
+            print("-" * 40)
+            print("Contiguity stats")
+            print(" - Readblocks")
+            print(f"{'Cont. blocks':>12} {'Times':>10} {'Tot. blocks':>12}")
+            for k, v in sorted(self.contiguity.items()):
+                print(f"{k:>12d} {v:>10d} {k * v:>12d}")
+            print()
+
         def print_stats(self):
+            """Prints driver usage stats"""
             print("-" * 40)
             print("SDCard readblocks and writeblocks Stats")
             for key, value in self.stats.items():
                 if value is None:
                     value = "N/A"
-                print(f"{key:<20}: {value:>10}")
+                print(f"{key:<20}  {value:>10}")
             print("-" * 40)
 
         def clear(self):
+            """Clear stats"""
             self.__init__()
