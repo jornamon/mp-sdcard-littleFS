@@ -19,13 +19,21 @@ Example usage on ESP8266:
     os.listdir('/')
 
 Update @jornamon 2024: 
-- Modified to implement the block device extended interface.
+- Implement the block device extended interface.
 - Accepts arbitrary offsets and lengths in readblocks and writeblocks, with partial blocks handling.
 - Intercepts ioctl(6) erase command and ioctl(3) to handle the sync command.
-- Now it can be used with LittleFS2.
-- Implemented a block cache of variable size. LFS2 performs horribly ons SD cards without one.
+- Now it can be used with LittleFS2. Probably with any other file system that uses the block device interface.
+- Implemented a block cache of variable size. LFS2 performs horribly on SD cards without one.
   It makes many small and misaligned reads and writes, and the cache helps to cope with that.
-- The sync method now is more clever and tries to take advantage of multiblock writes.
+- The sync method now is more clever and tries to take advantage of multiblock writes when possible.
+- Debug an analysis features can be now enable / disable through debug_flags kwarg when instantiating the driver.
+  This might be eliminated in the final version to unclutter the code. Available: debug-stats (general usage
+  stats regarding block siquests) debug-contiguity (additional info about contiguity of block requests), debug-timing
+  (timing for parts of the code which are marked for timing, it requieres a DataStats class to be imported from data_stats.py).
+  Flags need to be present and set to True when instantiating the driver to activate de feature.
+- There's now a specific `block_evictor` method to handle the eviction policy. This allows to abstract the eviction
+  algorithm and implement different policies for testing or fine tunning. For now, only Least Recently Used (LRU) 
+  and Least Recently Used Clean (LRUC) are implemented.
 
 TODO:
 - Multiblock operations. It seems LFS2 does not use them, so it would primarily benefit FAT.
@@ -62,7 +70,15 @@ _TOKEN_DATA = const(0xFE)
 
 
 class SDCard:
-    def __init__(self, spi, cs, baudrate=1320000, cache_max_size=8, debug=False):
+    def __init__(
+        self,
+        spi,
+        cs,
+        baudrate=1320000,
+        cache_max_size=8,
+        eviction_policy="LRUC",
+        **debug_flags,
+    ):
         self.spi = spi
         self.cs = cs
 
@@ -74,9 +90,15 @@ class SDCard:
         self.dummybuf_memoryview = memoryview(self.dummybuf)
 
         # Debug. Collect stats to analyze behavior of file system and cache
-        self.debug = debug
-        if debug:
+        self._debug_flags: dict = debug_flags
+        if self._debug_flags.get("debug_stats", False):
             self.stats = self.Stats()
+
+        if self._debug_flags.get("debug_timing", False):
+            from data_stats import DataStats
+
+            self._timing_get = DataStats(1000)
+            self._timing_evict_block = DataStats(1000)
 
         # Cache data structures
         self._tempbuf = bytearray(512)  # Temporary buffer for partial block handling
@@ -87,6 +109,7 @@ class SDCard:
         self._blocks: dict[int, int] = {}
         self._cache: list[bytearray] = [bytearray(512) for _ in range(cache_max_size)]
         self._mvc: list[memoryview] = [memoryview(b) for b in self._cache]
+        self._eviction_policy = eviction_policy
         ####
 
         # initialise the card
@@ -281,12 +304,40 @@ class SDCard:
         self.cs(1)
         self.spi.write(b"\xff")
 
+    def block_evictor(self, nblocks: int) -> list[tuple[int, int]]:
+        """Selects nblocks blocks to be evicted from cache based on active eviction policy.
+        Returns a list of tuples with the block number and the slot in the cache."""
+        if self._eviction_policy == "LRU":
+            # Least Recently Used
+            return [(block, self._blocks[block]) for block in self._usage_order[:nblocks]]
+        elif self._eviction_policy == "LRUC":
+            # Least Recently Used *Clean* block
+            clean_blocks = [
+                (block, self._blocks[block])
+                for block in self._usage_order
+                if not self._dirty[self._blocks[block]]
+            ]
+            if len(clean_blocks) < nblocks:
+                # Not enough clean blocks. Sync and return the oldest blocks (now clean)
+                self.sync()
+                clean_blocks = [
+                    (block, self._blocks[block]) for block in self._usage_order[:nblocks]
+                ]
+                return clean_blocks
+            else:
+                return clean_blocks[:nblocks]
+        else:
+            raise ValueError("Unknown eviction policy")
+
     def get(self, block_num: int, buf: memoryview) -> None:
         """Get a block from cache."""
         if len(buf) != 512:
             raise ValueError("Buffer must be 512 bytes.")
 
-        if self.debug:
+        # DEBUG features. DELETE later?
+        if self._debug_flags.get("debug_timing", False):
+            start_get = time.ticks_us()
+        if self._debug_flags.get("debug_contiguity", False):
             self.stats.register_contiguity("get", block_num)
 
         if self._cache_max_size == 0:
@@ -299,38 +350,53 @@ class SDCard:
         mvb = memoryview(buf)
         dirty = self._dirty
         if block_num in blocks:
-            if self.debug:
-                self.stats.stats["rb_cache_hit"] += 1  # type: ignore
+            # Cache hit, return result from cache
+            if self._debug_flags.get("debug_stats", False):
+                self.stats.stats["rb_cache_hit"] += 1
             slot = blocks[block_num]
             mvb[:] = mvc[slot][:]
             uo.remove(block_num)
             uo.append(block_num)
         else:
-            if self.debug:
-                self.stats.stats["rb_cache_miss"] += 1  # type: ignore
+            # Cache miss
+            if self._debug_flags.get("debug_stats", False):
+                self.stats.stats["rb_cache_miss"] += 1
             cache_size = len(blocks)
             if cache_size == self._cache_max_size:
-                oldest_block = uo.pop(0)
-                slot = blocks[oldest_block]
-                if oldest_block != -1 and dirty[slot]:
-                    self.write_to_sd(oldest_block, mvc[slot])
-                    if self.debug:
+                # Cache is full, evict a block
+                if self._debug_flags.get("debug_timing", False):
+                    start_evict_block = time.ticks_us()
+                # print("DEBUG: Evictor returned", self.block_evictor(1))
+                evicted_block, slot = self.block_evictor(1)[0]
+                if self._debug_flags.get("debug_timing", False):
+                    elapsed = time.ticks_diff(time.ticks_us(), start_evict_block)  # type: ignore
+                    self._timing_evict_block.add_sample(elapsed)
+
+                uo.remove(evicted_block)
+                if evicted_block != -1 and dirty[slot]:
+                    self.write_to_sd(evicted_block, mvc[slot])
+                    if self._debug_flags.get("debug_stats", False):
                         self.stats.stats["sb_flush"] += 1
-                blocks.pop(oldest_block, None)
+                blocks.pop(evicted_block)
             else:
+                # Cache is not full, keep adding blocks
                 slot = cache_size
+            # Fetch requested block from SD and update cache
             self.read_from_sd(block_num, mvc[slot])
             dirty[slot] = False
             blocks[block_num] = slot
             uo.append(block_num)
             mvb[:] = mvc[slot][:]
+            if self._debug_flags.get("debug_timing", False):
+                elapsed = time.ticks_diff(time.ticks_us(), start_get)  # type: ignore
+                self._timing_get.add_sample(elapsed)
 
     def put(self, block_num: int, buf: memoryview) -> None:
         """Put a block into cache."""
         if len(buf) != 512:
             raise ValueError("Buffer must be 512 bytes.")
 
-        if self.debug:
+        if self._debug_flags.get("debug_stats", False):
             self.stats.register_contiguity("put", block_num)
 
         # No cache
@@ -346,7 +412,7 @@ class SDCard:
 
         if block_num in blocks:
             # Cache hit
-            if self.debug:
+            if self._debug_flags.get("debug_stats", False):
                 self.stats.stats["wb_cache_hit"] += 1
             slot = blocks[block_num]
             mvc[slot][:] = mvb[:]
@@ -355,17 +421,17 @@ class SDCard:
             uo.append(block_num)
         else:
             # Cache miss
-            if self.debug:
+            if self._debug_flags.get("debug_stats", False):
                 self.stats.stats["wb_cache_miss"] += 1
             cache_size = len(blocks)
             if cache_size == self._cache_max_size:
-                oldest_block = uo.pop(0)
-                slot = blocks[oldest_block]
-                if oldest_block != -1 and dirty[slot]:
-                    self.write_to_sd(oldest_block, mvc[slot])
-                    if self.debug:
+                evicted_block, slot = self.block_evictor(1)[0]
+                uo.remove(evicted_block)
+                if evicted_block != -1 and dirty[slot]:
+                    self.write_to_sd(evicted_block, mvc[slot])
+                    if self._debug_flags.get("debug_stats", False):
                         self.stats.stats["sb_flush"] += 1
-                blocks.pop(oldest_block, None)
+                blocks.pop(evicted_block)
             else:
                 slot = cache_size
             mvc[slot][:] = mvb[:]
@@ -398,7 +464,7 @@ class SDCard:
                 self.write_to_sd(dirty_blocks[i][0], mvc[dirty_blocks[i][1]])
                 dirty[dirty_blocks[i][1]] = False
                 i += 1
-                if self.debug:
+                if self._debug_flags.get("debug_stats", False):
                     self.stats.stats["sb_sync"] += 1
             else:
                 # Contiguous blocks
@@ -423,7 +489,7 @@ class SDCard:
                 dirty[dirty_blocks[i][1]] = False
                 i += 1
                 contiguos_blocks += 1
-                if self.debug:
+                if self._debug_flags.get("debug_stats", False):
                     self.stats.stats["mb_sync"] += contiguos_blocks
 
     def read_from_sd(self, block_num: int, buf: memoryview) -> None:
@@ -455,7 +521,7 @@ class SDCard:
         mvb = memoryview(buf)
         mvt = self._mvt
 
-        if self.debug:
+        if self._debug_flags.get("debug_stats", False):
             aligned = offset == 0 and (offset + len_buf) % 512 == 0
             miss_left = offset > 0 and (offset + len_buf) % 512 == 0
             miss_right = offset == 0 and (offset + len_buf) % 512 > 0
@@ -516,7 +582,7 @@ class SDCard:
         first_misaligned = offset > 0
         last_misaligned = (offset + len_buf) % 512 > 0
 
-        if self.debug:
+        if self._debug_flags.get("debug_stats", False):
             aligned = offset == 0 and (offset + len_buf) % 512 == 0
             miss_left = offset > 0 and (offset + len_buf) % 512 == 0
             miss_right = offset == 0 and (offset + len_buf) % 512 > 0
@@ -570,7 +636,7 @@ class SDCard:
                 self.put(block_num, mvt)
 
     def ioctl(self, op, arg):
-        if self.debug:
+        if self._debug_flags.get("debug_stats", False):
             self.stats.collect("ioctl", ioctl=op)
         if op == 3:  # sync
             self.sync()
@@ -582,7 +648,7 @@ class SDCard:
         if op == 6:  # Ersase block, handled by the controller
             return 0
 
-    def cache_reset(self, cache_max_size: int) -> None:
+    def cache_reset(self, cache_max_size: int, policy: str = "LRU") -> None:
         """Reset the cache. This is mainly for testing purposes, to change
         the cache size on the fly during test runs."""
         self._cache_max_size = cache_max_size
@@ -591,6 +657,7 @@ class SDCard:
         self._blocks = {}
         self._cache = [bytearray(512) for _ in range(cache_max_size)]
         self._mvc = [memoryview(b) for b in self._cache]
+        self._eviction_policy = policy
 
     def show_cache_status(self):
         """Print the cache status."""
