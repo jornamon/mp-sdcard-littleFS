@@ -129,10 +129,7 @@ class Analytics:
         self.fslog = Log()
 
     def collect(self, key, value=None, mode="count"):
-        if not any(
-            self.flags.get(flag, False)
-            for flag in ["collect", "acollect", "dcollect", "debug_collect"]
-        ):
+        if not self.flags.get("analytics", False):
             return
         if key in self.stats:
             if mode == "count":
@@ -164,17 +161,15 @@ class Analytics:
                 self.stats[key] = value
 
     def print(self, *args, **kwargs):
-        if any(
-            self.flags.get(flag, False) for flag in ["aprint", "dprint", "debug_print", "print"]
-        ):
+        if any(self.flags.get(flag, False) for flag in ["debug_print", "print"]):
             print(*args, **kwargs)
 
     def log(self, message: str):
-        if any(self.flags.get(flag, False) for flag in ["log", "dlog", "alog", "debug_log"]):
+        if self.flags.get("analytics", False):
             self.fslog.log(message)
 
     def print_log(self):
-        print("------ RingLog ------")
+        print("-------- Log --------")
         for message in self.fslog._log:
             print(message)
         print("---------------------")
@@ -182,7 +177,7 @@ class Analytics:
     def print_stats(self):
         full_list = []
         fclen = max([len(str(key)) for key in self.stats]) + 5
-        print("------ Analytics ------")
+        print("------ Usage Stats ------")
         print(f"{'Key':<{fclen}} {'Value':>10}")
         for key, value in sorted(self.stats.items()):
             if isinstance(value, DataStats):
