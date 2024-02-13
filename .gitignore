@@ -14,7 +14,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -161,4 +160,9 @@ cython_debug/
 mpbridge.ignore
 .vscode/**
 typings/**
-
+sdcard_lfs_bak data structures.py
+sdcard_lfs_bak read ahead.py
+sdcarf_lfs_*
+cache_stats.py
+sdcard.py
+scratchpad/**
