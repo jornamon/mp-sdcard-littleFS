@@ -4,7 +4,7 @@ This document contains the results of the tests performed on the project. The re
 
 >**It all depends on the specific use case: the hardware, the app and the type of workload on the filesystem.**
 
-All the test wer performed with the script [fs_test.py](tests/fs_test.py) and with the following workloads as reference (although I'm not posting all possible combinations).
+All the test wer performed with the script [fs_tests.py](tests/fs_tests.py) and with the following workloads as reference (although I'm not posting all possible combinations).
 
 ```python
 big_file = [(1, 512 * 1024)]
