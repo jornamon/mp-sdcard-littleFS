@@ -138,8 +138,8 @@ class Cache:
         self._block_size = block_size
         self._cache_max_size = cache_max_size
         self._eviction_policy = eviction_policy.upper()
-        if read_ahead < 1 or read_ahead > cache_max_size:
-            raise ValueError("Read ahead must be between 1 and cache_max_size")
+        if read_ahead < 1 or read_ahead > cache_max_size // 2:
+            raise ValueError("Read ahead must be between 1 and cache_max_size // 2")
         self._read_ahead = read_ahead
         self._debug_flags = debug_flags
         self.a: Analytics  # type: ignore # Will be populated by the SDCard class
