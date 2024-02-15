@@ -30,11 +30,9 @@ Update @jornamon 2024:
   algorithm and implement different policies for testing or fine tunning. For now, only Least Recently Used (LRU) 
   and Least Recently Used Clean (LRUC) are implemented.
 - Implement a configurable Read Ahead feature, which can be set to 1 (no read ahead), or any number of blocks to
-  read ahead. This improves performance specially in reads.
+  read ahead.
 - Debug and analysis features can be now enable / disable through debug_flags kwarg when instantiating the driver.
-  This might be eliminated in the final version to unclutter the code. Available: analytics (collect general usage
-  stats regarding block requests and logs), print (print debug messages).
-  Flags need to be present and set to True when instantiating the driver to activate de feature.
+  Sea docs for details. Be carefull, enabling debug features dramatically slows down the driver.
 - The basic usage signature is the same as the original driver, but now it accepts a few more optional arguments to
   configure the cache and debug features.
   
@@ -42,21 +40,17 @@ import machine, sdcard_lfs, os
     sd = sdcard_lfs.SDCard(
         machine.SPI(1),
         machine.Pin(15),
-        cache_max_size=8,
+        cache_max_size=16,
         read_ahead=1,
         eviction_policy="LRUC",
-        print=True,
-        log=True,
-        collect=True,
     )
     os.VfsLfs2.mkfs(sd)   # If not already formated
     os.mount(sd, '/sd')  # If not already mounted
     os.listdir('/')
 
 TODO:
-- Test LFS with smaller device sizes to see if speed improves. I could just spoof the number of sectors.
-- Fix bug with LFS when RA > 1 failing.
-- Pinned blocks. This is a feature that allows to pin blocks in the cache. This is usefull for secial blocks accesed frequently.
+- Pinned blocks. This is a feature that allows to pin blocks in the cache. This is usefull for special blocks accessed frequently.
+- Time get and put vs actual device operations to estimate cache overhead.
 
 Original driver: https://github.com/micropython/micropython-lib/blob/master/micropython/drivers/storage/sdcard/sdcard.py
 """
@@ -65,22 +59,6 @@ try:
     from typing import Any
 except ImportError:
     pass
-try:
-    from analytics import Analytics  # type: ignore
-except ImportError:
-    # fmt: off
-    print("Analytics not available. To use Analytics.log or Analytics.collect etc. you need to have the analytics.py file in the import path. File avalable inside repo lib forlder. A mock class that does nothing  will be used")  # fmt: skip
-    class Analytics:
-        def __init__(self, *args, **kwargs):
-            self.fslog: Any
-        def collect(self, *args, **kwargs): pass
-        def log(self, *args, **kwargs): pass
-        def print_all(self): pass
-        def print(self, *args, **kwargs): pass
-        def print_log(self, *args, **kwargs): pass
-        def print_stats(self, *args, **kwargs): pass
-        def clear(self, *args, **kwargs): pass
-    # fmt: on
 
 import time
 from micropython import const
@@ -135,8 +113,8 @@ class Block:
         self.content = content
 
     def __str__(self):
-        # return f"Block({self.block_num}, {self.dirty}, )"
-        return f"Block({self.block_num}, {self.dirty}, {list(self.content[:4])})"
+        return f"Block({self.block_num}, {self.dirty})"
+        # return f"Block({self.block_num}, {self.dirty}, {list(self.content[:4])})"
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -164,21 +142,21 @@ class Cache:
             raise ValueError("Read ahead must be between 1 and cache_max_size")
         self._read_ahead = read_ahead
         self._debug_flags = debug_flags
-        self.a: Analytics  # Will be populated by the SDCard class
+        self.a: Analytics  # type: ignore # Will be populated by the SDCard class
 
         self._cache: list[bytearray] = [bytearray(block_size) for _ in range(cache_max_size)]
         self._blocks: LRMDict = LRMDict()
         self._device = device
 
     def block_evictor(self, nblocks: int) -> list[Block]:
-        """Selects nblocks blocks to be evicted from cache acording to active eviction policy.
+        """Selects nblocks blocks to be evicted from cache according to active eviction policy.
         Returns the list of evicted Blocks."""
 
         blocks = self._blocks
         if self._eviction_policy == "LRU":
             # Least Recently Used
             evicted_blocks = list(blocks.values())[:nblocks]
-            self.a.log(f"->block_evictor({nblocks}) LRU, returned {evicted_blocks}")  # fmt: skip
+            # self.a.log(f"->block_evictor({nblocks}) LRU, returned {evicted_blocks}")  # fmt: skip
             return evicted_blocks
 
         elif self._eviction_policy == "LRUC":
@@ -188,13 +166,13 @@ class Cache:
                 if not block.dirty:
                     clean_blocks.append(block)
                     if len(clean_blocks) == nblocks:
-                        self.a.log(f"->block_evictor({nblocks}) LRUC, returned {clean_blocks}")  # fmt: skip
+                        # self.a.log(f"->block_evictor({nblocks}) LRUC, returned {clean_blocks}")  # fmt: skip
                         return clean_blocks
             # Not enough clean blocks. Sync and return the oldest blocks (now clean)
-            self.a.log(f"->block_evictor({nblocks}) LRUC, not enough clean blocks, syncing")  # fmt: skip
+            # self.a.log(f"->block_evictor({nblocks}) LRUC, not enough clean blocks, syncing")  # fmt: skip
             self.sync()
             evicted_blocks = list(blocks.values())[:nblocks]
-            self.a.log(f"->block_evictor({nblocks}) LRUC, returned {evicted_blocks}")  # fmt: skip
+            # self.a.log(f"->block_evictor({nblocks}) LRUC, returned {evicted_blocks}")  # fmt: skip
             return evicted_blocks
         else:
             raise ValueError(f"Unknown eviction policy {self._eviction_policy}")
@@ -209,7 +187,6 @@ class Cache:
             # Bypass cache creating an adhoc block pointing to the buffer
             self.read_from_device([Block(block_num, False, buf)])
             return
-
         blocks = self._blocks
         ra = self._read_ahead
         max_size = self._cache_max_size
@@ -217,64 +194,60 @@ class Cache:
 
         if block_num in blocks:
             # Cache hit, return result from cache
-            self.a.collect("cache/get/hit")  # fmt: skip
-            self.a.log(f"->cache/get/hit {block_num}")  # fmt: skip
+            # self.a.collect("cache/get/hit")  # fmt: skip
+            # self.a.log(f"->cache/get/hit {block_num}")  # fmt: skip
 
             mvb[:] = blocks[block_num].content[:]
             blocks.move_to_end(block_num)
 
         else:
             # Cache miss
-            self.a.collect("cache/get/miss")  # fmt: skip
+            # self.a.collect("cache/get/miss")  # fmt: skip
 
             cache_size = len(blocks)
             if cache_size == self._cache_max_size:
-                self.a.collect("cache/get/miss/full")  # fmt: skip
-                self.a.log(f"->cache/get/miss/full {block_num}")  # fmt: skip
+                # self.a.collect("cache/get/miss/full")  # fmt: skip
+                # self.a.log(f"->cache/get/miss/full {block_num}")  # fmt: skip
 
                 # Cache is full, evict blocks
                 if set(blocks.keys()).intersection(range(block_num, block_num + ra)):
                     # Avoid read ahead if any block to be read ahead is already in the cache.
-                    # TODO consider a more sophisticated way to handle this
-                    self.a.log(f"->cache/get/miss/full read ahead avoided")  # fmt: skip
-                    self.a.collect(f"cache/get/miss/full/ra_avoided")  # fmt: skip
+                    # TODO consider a more sophisticated way to handle this. Worth it?
+                    # self.a.log(f"->cache/get/miss/full read ahead avoided")  # fmt: skip
+                    # self.a.collect(f"cache/get/miss/full/ra_avoided")  # fmt: skip
                     ra = 1
                 evicted_blocks = self.block_evictor(ra)
-                self.a.log(f"->cache/get/miss/full evicted blocks before processing {evicted_blocks}")  # fmt: skip
                 for i, block in enumerate(evicted_blocks):
                     if block.dirty:
                         # TODO This check could be eliminated if only LRUC is used. Or any policy that only returns clean blocks.
                         # Consider disabling LRU altogether
                         # Also, could be optimized for multiblock writes if not eliminated.
-                        self.a.log(f"->cache/get/miss/full dirty block evicted, writting to device {block.block_num}")  # fmt: skip
+                        # self.a.log(f"->cache/get/miss/full dirty block evicted, writting to device {block.block_num}")  # fmt: skip
                         self.write_to_device([block])
                     # Update block metadata and get from device
                     blocks.pop(block.block_num)
                     block.dirty = False
                     block.block_num = block_num + i
                     blocks[block.block_num] = block
-                self.a.log(f"->cache/get/miss/full evicted blocks after processing {evicted_blocks}")  # fmt: skip
-                self.a.log(f"->cache/get/miss/full cache blocks before reading from device {self._blocks}")  # fmt: skip
                 self.read_from_device(evicted_blocks)
-                self.a.log(f"->cache/get/miss/full cache blocks after reading from device {self._blocks}")  # fmt: skip
+                # self.a.log(f"->cache/get/miss/full cache blocks after operation {self._blocks}")  # fmt: skip
                 mvb[:] = evicted_blocks[0].content[:]
             else:
                 # Cache is not full, Create and add new blocks.
-                self.a.collect(f"cache/get/miss/not_full")  # fmt: skip
-                self.a.log(f"->cache/get/miss/not_full block_num {block_num}")  # fmt: skip
+                # self.a.collect(f"cache/get/miss/not_full")  # fmt: skip
+                # self.a.log(f"->cache/get/miss/not_full block_num {block_num}")  # fmt: skip
                 slots = range(
                     cache_size,
                     cache_size + min(ra, max_size - cache_size),
                 )
-                self.a.log(f"->cache/get/miss/not_full slots {list(slots)}")  # fmt: skip
+                # self.a.log(f"->cache/get/miss/not_full slots {list(slots)}")  # fmt: skip
                 new_blocks = []
                 for i, slot in enumerate(slots):
                     b = Block(block_num + i, False, memoryview(self._cache[slot]))
                     new_blocks.append(b)
                     blocks[block_num + i] = b
-                self.a.log(f"->cache/get/miss/not_full new blocks before reading {new_blocks}")  # fmt: skip
                 self.read_from_device(new_blocks)
-                self.a.log(f"->cache/get/miss/not_full new blocks after reading {new_blocks}")  # fmt: skip
+                # self.a.log(f"->cache/get/miss/not_full new blocks after operation {new_blocks}")  # fmt: skip
                 mvb[:] = new_blocks[0].content[:]
 
     def put(self, block_num: int, buf: memoryview) -> None:
@@ -282,7 +255,7 @@ class Cache:
         if len(buf) != self._block_size:
             raise ValueError(f"Buffer must be {self._block_size} bytes.")
 
-        self.a.collect("cache/put")  # fmt: skip
+        # self.a.collect("cache/put")  # fmt: skip
 
         # No cache
         if self._cache_max_size == 0:
@@ -295,8 +268,8 @@ class Cache:
 
         if block_num in blocks:
             # Cache hit
-            self.a.log(f"->cache/put/hit block num {block_num}")  # fmt: skip
-            self.a.collect("cache/put/hit")  # fmt: skip
+            # self.a.log(f"->cache/put/hit block num {block_num}")  # fmt: skip
+            # self.a.collect("cache/put/hit")  # fmt: skip
 
             blocks[block_num].content[:] = mvb[:]
             blocks[block_num].dirty = True
@@ -304,7 +277,7 @@ class Cache:
         else:
             # Cache miss
 
-            self.a.collect("cache/put/miss")  # fmt: skip
+            # self.a.collect("cache/put/miss")  # fmt: skip
 
             cache_size = len(blocks)
             if cache_size == self._cache_max_size:
@@ -313,8 +286,8 @@ class Cache:
                 if evicted_block.dirty:
                     self.write_to_device([evicted_block])
 
-                self.a.collect("cache/put/miss/full")  # fmt: skip
-                self.a.log(f"->cache/put/miss/full block {block_num}, evicting {evicted_block}, blocks {self._blocks}")  # fmt: skip
+                # self.a.collect("cache/put/miss/full")  # fmt: skip
+                # self.a.log(f"->cache/put/miss/full block {block_num}, evicting {evicted_block}, blocks {self._blocks}")  # fmt: skip
 
                 blocks.pop(evicted_block.block_num)
                 evicted_block.block_num = block_num
@@ -327,8 +300,8 @@ class Cache:
                 blocks[block_num] = Block(block_num, True, memoryview(self._cache[slot]))
                 blocks[block_num].content[:] = mvb[:]
 
-                self.a.collect("cache/put/miss/not_full")  # fmt: skip
-                self.a.log(f"->cache/put/miss/not_full @end {block_num}, slot {slot}, blocks {self._blocks}")  # fmt: skip
+                # self.a.collect("cache/put/miss/not_full")  # fmt: skip
+                # self.a.log(f"->cache/put/miss/not_full @end {block_num}, slot {slot}, blocks {self._blocks}")  # fmt: skip
 
     def sync(self) -> None:
         """Write all dirty blocks to SD card.
@@ -343,10 +316,10 @@ class Cache:
         dirty_blocks = sorted(
             (block for block in blocks.values() if block.dirty), key=lambda x: x.block_num
         )
-        self.a.log(f"->cache/sync dirty blocks {dirty_blocks}")  # fmt: skip
-        self.a.collect(f"cache/sync/total")  # fmt: skip
+        # self.a.log(f"->cache/sync dirty blocks {dirty_blocks}")  # fmt: skip
+        # self.a.collect(f"cache/sync/total")  # fmt: skip
         if not dirty_blocks:
-            self.a.collect(f"cache/sync/nodirtyblocks")  # fmt: skip
+            # self.a.collect(f"cache/sync/nodirtyblocks")  # fmt: skip
             return
 
         block_groups = [[dirty_blocks[0]]]
@@ -363,7 +336,7 @@ class Cache:
         for group in block_groups:
             self.write_to_device(group)
 
-        self.a.log(f"->cache/sync dirty block groups {block_groups}, blocks {self._blocks}")  # fmt: skip
+        # self.a.log(f"->cache/sync dirty block groups {block_groups}, blocks {self._blocks}")  # fmt: skip
 
     def read_from_device(self, blocks: list[Block]) -> None:
         """Read blocks fron the device to the cache blocks.
@@ -454,7 +427,7 @@ class SDCard:
         cs,
         baudrate=1320000,
         block_size: int = 512,
-        cache_max_size: int = 8,
+        cache_max_size: int = 16,
         eviction_policy: str = "LRUC",
         read_ahead: int = 1,
         **debug_flags,
@@ -476,11 +449,26 @@ class SDCard:
             self, block_size, cache_max_size, eviction_policy, read_ahead, **debug_flags
         )
         ####
-        # Set up Analytics. Can be deleted later
-
+        # Set up Analytics. Can be deleted later. Import or mock class to reduce overhead.
+        self._debug_flags = debug_flags
+        if self._debug_flags.get("analytics", False):
+            from analytics import Analytics  # type: ignore
+        else:
+            # fmt: off
+            print("Analytics not available. To use Analytics.log or Analytics.collect etc. you need to have the analytics.py file in the import path. File avalable inside repo lib forlder. A mock class that does nothing  will be used")  # fmt: skip
+            class Analytics:
+                def __init__(self, *args, **kwargs):
+                    self.fslog: Any
+                def collect(self, *args, **kwargs): pass
+                def log(self, *args, **kwargs): pass
+                def print_all(self): pass
+                def print(self, *args, **kwargs): pass
+                def print_log(self, *args, **kwargs): pass
+                def print_stats(self, *args, **kwargs): pass
+                def clear(self, *args, **kwargs): pass
+            # fmt: on
         self.a = Analytics(**debug_flags)
         self._cache.a = self.a
-        self._debug_flags = debug_flags
 
         # initialise the card
         self.init_card(baudrate)
@@ -685,32 +673,35 @@ class SDCard:
         mvb = memoryview(buf)
         mvt = self._mvt
 
-        if self._cache._debug_flags.get("analytics", False):
-            # Stats collection
-            aligned = offset == 0 and (offset + len_buf) % 512 == 0
-            miss_left = offset > 0 and (offset + len_buf) % 512 == 0
-            miss_right = offset == 0 and (offset + len_buf) % 512 > 0
-            miss_both = offset > 0 and (offset + len_buf) % 512 > 0
-            self.a.log(f"->sdcard/rb: {block_num}, offset {offset}, nblocks {nblocks}, len_buf {len_buf}")  # fmt: skip
-            self.a.collect("sdcard/rb")
-            if nblocks == 1:
-                self.a.collect("sdcard/rb/single")
-                self.a.collect("sdcard/rb/single/min", len_buf, mode="min")
-                self.a.collect("sdcard/rb/single/max", len_buf, mode="max")
-                self.a.collect("sdcard/rb/single/avg", len_buf, mode="avg")
-                self.a.collect("sdcard/rb/single/aligned") if aligned else None
-                self.a.collect("sdcard/rb/single/miss_left") if miss_left else None
-                self.a.collect("sdcard/rb/single/miss_right") if miss_right else None
-                self.a.collect("sdcard/rb/single/miss_both") if miss_both else None
-            else:
-                self.a.collect("sdcard/rb/multi")
-                self.a.collect("sdcard/rb/multi/min", len_buf, mode="min")
-                self.a.collect("sdcard/rb/multi/max", len_buf, mode="max")
-                self.a.collect("sdcard/rb/multi/avg", len_buf, mode="avg")
-                self.a.collect("sdcard/rb/multi/aligned") if aligned else None
-                self.a.collect("sdcard/rb/multi/miss_left") if miss_left else None
-                self.a.collect("sdcard/rb/multi/miss_right") if miss_right else None
-                self.a.collect("sdcard/rb/multi/miss_both") if miss_both else None
+        # DEBUG
+        # if self._cache._debug_flags.get("analytics", False):
+        #     # Stats collection
+        #     aligned = offset == 0 and (offset + len_buf) % 512 == 0
+        #     miss_left = offset > 0 and (offset + len_buf) % 512 == 0
+        #     miss_right = offset == 0 and (offset + len_buf) % 512 > 0
+        #     miss_both = offset > 0 and (offset + len_buf) % 512 > 0
+        #     # self.a.log(f"->sdcard/rb: {block_num}, offset {offset}, nblocks {nblocks}, len_buf {len_buf}")  # fmt: skip
+        #     # self.a.collect("sdcard/rb")
+        #     if nblocks == 1:
+        #         pass
+        #         # self.a.collect("sdcard/rb/single")
+        #         # self.a.collect("sdcard/rb/single/min", len_buf, mode="min")
+        #         # self.a.collect("sdcard/rb/single/max", len_buf, mode="max")
+        #         # self.a.collect("sdcard/rb/single/avg", len_buf, mode="avg")
+        #         # self.a.collect("sdcard/rb/single/aligned") if aligned else None
+        #         # self.a.collect("sdcard/rb/single/miss_left") if miss_left else None
+        #         # self.a.collect("sdcard/rb/single/miss_right") if miss_right else None
+        #         # self.a.collect("sdcard/rb/single/miss_both") if miss_both else None
+        #     else:
+        #         pass
+        #         # self.a.collect("sdcard/rb/multi")
+        #         # self.a.collect("sdcard/rb/multi/min", len_buf, mode="min")
+        #         # self.a.collect("sdcard/rb/multi/max", len_buf, mode="max")
+        #         # self.a.collect("sdcard/rb/multi/avg", len_buf, mode="avg")
+        #         # self.a.collect("sdcard/rb/multi/aligned") if aligned else None
+        #         # self.a.collect("sdcard/rb/multi/miss_left") if miss_left else None
+        #         # self.a.collect("sdcard/rb/multi/miss_right") if miss_right else None
+        #         # self.a.collect("sdcard/rb/multi/miss_both") if miss_both else None
 
         if nblocks == 1:
             # Only one block to read (partial or complete)
@@ -757,32 +748,35 @@ class SDCard:
         first_misaligned = offset > 0
         last_misaligned = (offset + len_buf) % 512 > 0
 
-        if self._cache._debug_flags.get("analytics", False):
-            # Stats collection
-            aligned = offset == 0 and (offset + len_buf) % 512 == 0
-            miss_left = offset > 0 and (offset + len_buf) % 512 == 0
-            miss_right = offset == 0 and (offset + len_buf) % 512 > 0
-            miss_both = offset > 0 and (offset + len_buf) % 512 > 0
-            self.a.log(f"->sdcard/wb: {block_num}, offset {offset}, nblocks {nblocks}, len_buf {len_buf}")  # fmt: skip
-            self.a.collect("sdcard/wb")
-            if nblocks == 1:
-                self.a.collect("sdcard/wb/single")
-                self.a.collect("sdcard/wb/single/min", len_buf, mode="min")
-                self.a.collect("sdcard/wb/single/max", len_buf, mode="max")
-                self.a.collect("sdcard/wb/single/avg", len_buf, mode="avg")
-                self.a.collect("sdcard/wb/single/aligned") if aligned else None
-                self.a.collect("sdcard/wb/single/miss_left") if miss_left else None
-                self.a.collect("sdcard/wb/single/miss_right") if miss_right else None
-                self.a.collect("sdcard/wb/single/miss_both") if miss_both else None
-            else:
-                self.a.collect("sdcard/wb/multi")
-                self.a.collect("sdcard/wb/multi/min", len_buf, mode="min")
-                self.a.collect("sdcard/wb/multi/max", len_buf, mode="max")
-                self.a.collect("sdcard/wb/multi/avg", len_buf, mode="avg")
-                self.a.collect("sdcard/wb/multi/aligned") if aligned else None
-                self.a.collect("sdcard/wb/multi/miss_left") if miss_left else None
-                self.a.collect("sdcard/wb/multi/miss_right") if miss_right else None
-                self.a.collect("sdcard/wb/multi/miss_both") if miss_both else None
+        # DEBUG
+        # if self._cache._debug_flags.get("analytics", False):
+        #     # Stats collection
+        #     aligned = offset == 0 and (offset + len_buf) % 512 == 0
+        #     miss_left = offset > 0 and (offset + len_buf) % 512 == 0
+        #     miss_right = offset == 0 and (offset + len_buf) % 512 > 0
+        #     miss_both = offset > 0 and (offset + len_buf) % 512 > 0
+        #     # self.a.log(f"->sdcard/wb: {block_num}, offset {offset}, nblocks {nblocks}, len_buf {len_buf}")  # fmt: skip
+        #     # self.a.collect("sdcard/wb")
+        #     if nblocks == 1:
+        #         pass
+        #         # self.a.collect("sdcard/wb/single")
+        #         # self.a.collect("sdcard/wb/single/min", len_buf, mode="min")
+        #         # self.a.collect("sdcard/wb/single/max", len_buf, mode="max")
+        #         # self.a.collect("sdcard/wb/single/avg", len_buf, mode="avg")
+        #         # self.a.collect("sdcard/wb/single/aligned") if aligned else None
+        #         # self.a.collect("sdcard/wb/single/miss_left") if miss_left else None
+        #         # self.a.collect("sdcard/wb/single/miss_right") if miss_right else None
+        #         # self.a.collect("sdcard/wb/single/miss_both") if miss_both else None
+        #     else:
+        #         pass
+        #         # self.a.collect("sdcard/wb/multi")
+        #         # self.a.collect("sdcard/wb/multi/min", len_buf, mode="min")
+        #         # self.a.collect("sdcard/wb/multi/max", len_buf, mode="max")
+        #         # self.a.collect("sdcard/wb/multi/avg", len_buf, mode="avg")
+        #         # self.a.collect("sdcard/wb/multi/aligned") if aligned else None
+        #         # self.a.collect("sdcard/wb/multi/miss_left") if miss_left else None
+        #         # self.a.collect("sdcard/wb/multi/miss_right") if miss_right else None
+        #         # self.a.collect("sdcard/wb/multi/miss_both") if miss_both else None
 
         mvt = self._mvt
         mvb = memoryview(buf)
@@ -821,9 +815,8 @@ class SDCard:
 
     def ioctl(self, op, arg):
         if op == 3:  # sync
-            if self._cache._debug_flags.get("analytics", False):
-                self.a.log(f"->sdcard: ioctl(3) sync")
-                self.a.collect("sdcard/sync/fs")
+            # self.a.log(f"->sdcard: ioctl(3) sync")
+            # self.a.collect("sdcard/sync/fs")
             self._cache.sync()
             return 0
         if op == 4:  # get number of blocks
@@ -831,5 +824,18 @@ class SDCard:
             return self.sectors
         if op == 5:  # get block size in bytes
             return 512
-        if op == 6:  # Ersase block, handled by the controller
+        if op == 6:  # Erase block, handled by the controller
+            # LFS expects the erased block to be really erased (xff) or it complains about data corruption.
+            # This doesn't make a lot of sense in the context of SD cards, but no other option for now.
+            block = self._cache._blocks.get(arg, None)
+            if block:
+                if block.dirty:
+                    raise OSError(f"SDCard: ioctl(6,{arg}) - Can't erase a dirty block")
+                else:
+                    block.content[:] = b"\xff" * 512
+                    block.dirty = True
+            else:
+                self._cache.put(arg, b"\xff" * 512)  # type: ignore
+            # self.a.log(f"->sdcard: eraseblock {arg}: {self._cache._blocks}")
+            # self.a.collect("sdcard/eraseblock")
             return 0
