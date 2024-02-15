@@ -95,16 +95,16 @@ def test_suite(
 
     gc.collect()
 
-    # Randomize the workload.
     workload = workload or [
         [2, 64 * 1024],
         [2, 16 * 1024],
-        [2, 4 * 1024],
-        [2, 1 * 1024],
-        [2, 256],
-        [2, 64],
+        [4, 4 * 1024],
+        [4, 1 * 1024],
+        [8, 256],
+        [8, 64],
     ]
 
+    # Randomize the workload.
     workload = [x[0] * [x[1]] for x in workload]
     workload = [item for sublist in workload for item in sublist]
     workload = shuffle(workload)
@@ -266,5 +266,3 @@ except Exception:
     sd._cache.show_cache_status()
     sd.a.print_all()
     raise
-
-
