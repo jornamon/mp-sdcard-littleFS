@@ -102,7 +102,7 @@ os.listdir('/')
 
 ## Testing
 
-The best way to test is to time the operations you're interested in, but there is handy script that runs a series of tests and prints the results in [tests/fs_test.py](tests/fs_test.py). This is the script I used for the tests in [**TEST_RESULTS.md**](TEST_RESULTS.md).
+The best way to test is to time the operations you're interested in, but there is handy script that runs a series of tests and prints the results in [tests/fs_tests.py](tests/fs_tests.py). This is the script I used for the tests in [**TEST_RESULTS.md**](TEST_RESULTS.md).
 
 The workload is a list of lists containing the number of files and the size of the files to be written, read and checked for consistency. The script tests all possible combinations of cache parameters.
 
