@@ -1,6 +1,5 @@
 """
 Test Device driver performance for filesystem read and write operations.
-TODO: Bug when using read_ahead > 1, only with LFS.
 """
 from collections import OrderedDict
 import os
@@ -10,7 +9,8 @@ import gc
 from machine import Pin, SPI
 from sdcard_lfs import SDCard
 
-# from sdcard import SDCard
+# from sdcard import SDCard as SDCard_original
+# from sdcard_ext import SDCard as SDCard_ext
 
 SCK = Pin(36)
 MOSI = Pin(35)
@@ -85,10 +85,10 @@ def test_suite(
     mode=["binary"],
     cache_size=[4],
     read_ahead=[1],
-    eviction_policty=["LRUC"],
+    eviction_policy=["LRUC"],
 ):
     """Applies a test suite for a given workload for all possible combinations of the parameters.
-    Workload is a list of tuples, each tupple contains the number of files and the size of the file.
+    Workload is a list of tuples, each tuple contains the number of files and the size of the file.
     Before starting, the workload is randomized to avoid any bias.
     For Example: [(1, 1 * 1024),(4, 256),...] will create 1 file of 1KB and 4 files of 256B,...
     Calculates the average speed for each combination and store results in a list of tuples."""
@@ -115,11 +115,11 @@ def test_suite(
     mvw = memoryview(write_buffer)
     read_buffer = bytearray(chunk_size)
     mvr = memoryview(read_buffer)
-    ntests = len(filesystem) * len(cache_size) * len(read_ahead) * len(eviction_policty)
+    ntests = len(filesystem) * len(cache_size) * len(read_ahead) * len(eviction_policy)
     nfiles = len(workload)
     total_size = sum(workload)
     filesystem = [fs.upper() for fs in filesystem]
-    eviction_policty = [e.upper() for e in eviction_policty]
+    eviction_policy = [e.upper() for e in eviction_policy]
     results = []
     nt = 1
     gc.collect()
@@ -127,7 +127,7 @@ def test_suite(
         for fs in filesystem:
             for csize in cache_size:
                 for ra in read_ahead:
-                    for e in eviction_policty:
+                    for e in eviction_policy:
                         # Reset cache with new parameters
                         sd._cache.reset_cache(
                             cache_max_size=csize,
@@ -146,6 +146,7 @@ def test_suite(
                             raise ValueError("Invalid filesystem")
                         mount(sd)
                         gc.collect()
+                        # gc.disable()  # Guarantees no gc interference with the test, but can lead to memory problems depending on the board and test.
 
                         # Write the files
                         nf = 1
@@ -168,6 +169,7 @@ def test_suite(
                                 end="",
                             )
                             nf += 1
+                            gc.collect()
                         avg_speed = total_size / 1024 / (tot_elapsed / 1_000_000)
                         results.append((fs, csize, ra, e, "write", avg_speed, tot_elapsed / 1_000_000))  # fmt: skip
 
@@ -198,6 +200,7 @@ def test_suite(
                             if chunk_error:
                                 # print(f"Error reading file {filename}")
                                 errors += 1
+                            gc.collect()
 
                         avg_speed = total_size / 1024 / (tot_elapsed / 1_000_000)
                         results.append((fs, csize, ra, e, "read", avg_speed, tot_elapsed / 1_000_000))  # fmt: skip
@@ -225,67 +228,43 @@ def test_suite(
 
 ########################
 
-sd = SDCard(
+sd_cache = SDCard(
     spi,
     CS,
-    cache_max_size=128,
+    cache_max_size=32,
     read_ahead=1,
     eviction_policy="LRUC",
     analytics=True,
     log=True,
     collect=True,
 )
-sd.a.fslog.max_size = 500
+# sd_original = SDCard_original(spi, CS)
+# sd_ext = SDCard_ext(spi, CS)
 
-# format_fat(sd)
-# mount(sd)
-# print(os.listdir("/sd"))
-# data_written = os.urandom(64)
-# data_read = bytearray(64)
-# print(write_file("/sd/test.bin", "wb", data_written))
-# print(read_file("/sd/test.bin", "rb", data_read))
-# print("Read correct", data_read == data_written)
-# print("Data written", data_written)
-# print("Data read", data_read)
+gc.collect()
+print(f"Allocated: {gc.mem_alloc()} Free: {gc.mem_free()}")
 
-# workload = [(1, 64 * 1024)]
-# workload = [
-#     [1, 256 * 1024],
-#     [2, 64 * 1024],
-#     [4, 16 * 1024],
-#     [8, 4 * 1024],
-#     [16, 1 * 1024],
-#     [32, 256],
-#     [64, 64],
-# ]
-workload = [
-    [1, 128 * 1024],
-    [2, 64 * 1024],
-    [2, 16 * 1024],
-    [2, 4 * 1024],
-    [2, 1 * 1024],
-    [2, 256],
-]
-test_suite(
-    sd,
-    workload=workload,
-    filesystem=["FAT"],
-    cache_size=[32],
-    read_ahead=[1,2,4,8,16],
-    eviction_policty=["LRUC"],
-)
+big_file = [(1, 512 * 1024)]
 
-# mount(sd)
-# files = os.listdir("/sd")
-# print(files)
-# prefix = "/sd/"
-# for file in files:
-#     gc.collect()
+small_files = [[32, 1024]]
 
-#     with open(f"{prefix}{file}", "rb") as f:
-#         print(f"Reading file {file}")
-#         read_data = bytearray(f.read())
-#         if read_data != bytearray(range(len(read_data))):
-#             print("Error reading file", file)
+mixed = [[2, 128 * 1024], [2, 64 * 1024], [4, 16 * 1024], [4, 4 * 1024], [8, 1 * 1024], [8, 256]]
 
-sd.a.print_all()
+sd = sd_cache
+sd.a.fslog.max_size = 250
+
+try:
+    test_suite(
+        sd,
+        workload=big_file,
+        filesystem=["LFS"],
+        cache_size=[32],
+        read_ahead=[1, 2, 4, 8, 16, 32],
+        eviction_policy=["LRUC"],
+    )
+except Exception:
+    sd._cache.show_cache_status()
+    sd.a.print_all()
+    raise
+
+
