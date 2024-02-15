@@ -176,7 +176,10 @@ class Analytics:
 
     def print_stats(self):
         full_list = []
-        fclen = max([len(str(key)) for key in self.stats]) + 5
+        try:
+            fclen = max([len(str(key)) for key in self.stats]) + 5
+        except ValueError:
+            fclen = 30
         print("------ Usage Stats ------")
         print(f"{'Key':<{fclen}} {'Value':>10}")
         for key, value in sorted(self.stats.items()):
