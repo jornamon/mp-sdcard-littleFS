@@ -166,3 +166,4 @@ sdcarf_lfs_*
 cache_stats.py
 sdcard.py
 scratchpad/**
+archived/**
