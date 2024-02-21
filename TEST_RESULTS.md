@@ -18,6 +18,8 @@ The performance of the original driver (only with FAT, obviously) is used as a r
 
 I tested it on a ESP32-S3 (8MB of PSRAM), with an "*integrated*" SPI SD card breakout like [this one](https://www.adafruit.com/product/4899) running micropython v1.22.0-preview.1.g523284777.
 
+> **UNITS:** Speeds are in KB/s, cache size is number of 512-byte blocks, and RA is also the number of 512-byte blocks to read ahead.
+
 ## Results
 
 ### Cache size
